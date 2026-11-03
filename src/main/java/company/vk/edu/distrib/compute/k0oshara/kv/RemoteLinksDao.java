@@ -57,7 +57,8 @@ final class RemoteLinksDao implements Dao<String> {
     @Override
     public void delete(String key) throws IllegalArgumentException, IOException {
         HttpResponse<String> response = send("DELETE", key, null);
-        if (response.statusCode() != HttpURLConnection.HTTP_ACCEPTED) {
+        if (response.statusCode() != HttpURLConnection.HTTP_ACCEPTED
+            && response.statusCode() != HttpURLConnection.HTTP_OK) {
             throw new IOException("Unexpected DELETE status: " + response.statusCode());
         }
     }
@@ -71,7 +72,7 @@ final class RemoteLinksDao implements Dao<String> {
         if (key == null || key.isEmpty()) {
             throw new IllegalArgumentException("Key must not be empty");
         }
-        int port = choosePort(key);
+        int port = choosePort(key, ports);
         HttpRequest.Builder request = HttpRequest.newBuilder()
             .uri(java.net.URI.create("http://localhost:" + port + "/v0/entity?id="
                 + URLEncoder.encode(key, StandardCharsets.UTF_8)));
@@ -90,7 +91,7 @@ final class RemoteLinksDao implements Dao<String> {
         }
     }
 
-    private int choosePort(String key) {
+    static int choosePort(String key, int... ports) {
         if (ports.length == SINGLE_NODE_COUNT) {
             return ports[0];
         }

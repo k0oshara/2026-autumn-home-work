@@ -10,6 +10,8 @@ import java.net.URI;
 import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
 import java.util.NoSuchElementException;
+import java.util.Set;
+import java.util.concurrent.CompletionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.locks.ReentrantLock;
@@ -20,15 +22,18 @@ import company.vk.edu.distrib.compute.kv.KVService;
 final class KvService implements KVService {
     private static final String STATUS_PATH = "/v0/status";
     private static final String ENTITY_PATH = "/v0/entity";
+    private static final String REPLICA_HEADER = "X-K0oshara-Replica";
     private static final String GET = "GET";
     private static final String PUT = "PUT";
     private static final String DELETE = "DELETE";
+    private static final Set<String> ENTITY_METHODS = Set.of(GET, PUT, DELETE);
     private static final int CREATED = 0;
     private static final int STARTED = 1;
     private static final int STOPPED = 2;
 
     private final HttpServer server;
     private final Dao<byte[]> dao;
+    private final Replication replication;
     private final ExecutorService executor;
     private final int port;
     private final ReentrantLock lifecycle = new ReentrantLock();
@@ -43,6 +48,7 @@ final class KvService implements KVService {
             server.setExecutor(executor);
         }
         this.port = port;
+        replication = new Replication(port, dao);
     }
 
     @Override
@@ -82,11 +88,10 @@ final class KvService implements KVService {
     }
 
     private void closeResources() {
-        if (executor != null) {
-            executor.shutdownNow();
-        }
-        try {
-            dao.close();
+        try (dao; replication) {
+            if (executor != null) {
+                executor.shutdownNow();
+            }
         } catch (IOException exception) {
             throw new IllegalStateException("Unable to close storage", exception);
         }
@@ -105,9 +110,9 @@ final class KvService implements KVService {
     private final class Handler implements HttpHandler {
         @Override
         public void handle(HttpExchange exchange) throws IOException {
-            try (exchange) {
+            try {
                 handleRequest(exchange);
-            } catch (IOException exception) {
+            } catch (IOException | RuntimeException exception) {
                 send(exchange, 503, null);
             }
         }
@@ -123,16 +128,43 @@ final class KvService implements KVService {
                 send(exchange, 404, null);
                 return;
             }
-            String key = getKey(uri);
-            if (key == null) {
+            if (!ENTITY_METHODS.contains(method)) {
+                send(exchange, 405, null);
+                return;
+            }
+            String key;
+            String ack;
+            try {
+                key = getParameter(uri, "id");
+                ack = getParameter(uri, "ack");
+            } catch (IllegalArgumentException exception) {
                 send(exchange, 400, null);
                 return;
             }
-            switch (method) {
-                case GET -> get(exchange, key);
-                case PUT -> put(exchange, key);
-                case DELETE -> delete(exchange, key);
-                default -> send(exchange, 405, null);
+            if (key == null || key.isEmpty()) {
+                send(exchange, 400, null);
+                return;
+            }
+            byte[] body = PUT.equals(method) ? exchange.getRequestBody().readAllBytes() : null;
+            boolean internal = "true".equalsIgnoreCase(
+                exchange.getRequestHeaders().getFirst(REPLICA_HEADER));
+            replication.execute(method, key, ack, body, internal)
+                .whenComplete((reply, failure) -> sendReply(exchange, reply, failure));
+        }
+
+        private void sendReply(
+            HttpExchange exchange,
+            Replication.Reply reply,
+            Throwable failure
+        ) {
+            try {
+                if (failure != null || reply == null) {
+                    send(exchange, 503, null);
+                } else {
+                    send(exchange, reply.status(), reply.body());
+                }
+            } catch (IOException exception) {
+                throw new CompletionException(exception);
             }
         }
 
@@ -150,48 +182,38 @@ final class KvService implements KVService {
             send(exchange, 200, null);
         }
 
-        private void get(HttpExchange exchange, String key) throws IOException {
-            try {
-                send(exchange, 200, dao.get(key));
-            } catch (NoSuchElementException exception) {
-                send(exchange, 404, null);
-            }
-        }
-
-        private void put(HttpExchange exchange, String key) throws IOException {
-            dao.upsert(key, exchange.getRequestBody().readAllBytes());
-            send(exchange, 201, null);
-        }
-
-        private void delete(HttpExchange exchange, String key) throws IOException {
-            dao.delete(key);
-            send(exchange, 202, null);
-        }
-
-        private String getKey(URI uri) {
+        private String getParameter(URI uri, String expectedName) {
             String query = uri.getRawQuery();
             if (query == null) {
                 return null;
             }
-            for (String parameter : query.split("&")) {
-                if (parameter.startsWith("id=")) {
-                    try {
-                        String key = URLDecoder.decode(parameter.substring(3),
-                            StandardCharsets.UTF_8);
-                        return key.isEmpty() ? null : key;
-                    } catch (IllegalArgumentException exception) {
-                        return null;
+            String value = null;
+            for (String parameter : query.split("&", -1)) {
+                int separator = parameter.indexOf('=');
+                String name = decodeParameter(separator < 0
+                    ? parameter : parameter.substring(0, separator));
+                if (expectedName.equals(name)) {
+                    if (value != null) {
+                        throw new IllegalArgumentException("Duplicate query parameter");
                     }
+                    value = decodeParameter(separator < 0
+                        ? "" : parameter.substring(separator + 1));
                 }
             }
-            return null;
+            return value;
+        }
+
+        private String decodeParameter(String value) {
+            return URLDecoder.decode(value, StandardCharsets.UTF_8);
         }
 
         private void send(HttpExchange exchange, int status, byte[] body) throws IOException {
-            exchange.sendResponseHeaders(status, body == null ? -1 : body.length);
-            if (body != null) {
-                try (OutputStream output = exchange.getResponseBody()) {
-                    output.write(body);
+            try (exchange) {
+                exchange.sendResponseHeaders(status, body == null ? -1 : body.length);
+                if (body != null) {
+                    try (OutputStream output = exchange.getResponseBody()) {
+                        output.write(body);
+                    }
                 }
             }
         }

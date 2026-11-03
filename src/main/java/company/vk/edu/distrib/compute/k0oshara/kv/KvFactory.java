@@ -6,8 +6,10 @@ import java.nio.file.Path;
 import company.vk.edu.distrib.compute.AbstractHttpServiceFactory;
 import company.vk.edu.distrib.compute.kv.KVService;
 import company.vk.edu.distrib.compute.kv.KVServiceTest;
+import company.vk.edu.distrib.compute.kv.ReplicatedKVServiceTest;
 
 @KVServiceTest
+@ReplicatedKVServiceTest
 public final class KvFactory extends AbstractHttpServiceFactory<KVService> {
     @Override
     protected KVService doCreate(int port) throws IOException {
